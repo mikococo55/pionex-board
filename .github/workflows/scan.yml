@@ -1,8 +1,6 @@
 name: 派網選幣看板
 
 on:
-  schedule:
-    - cron: "7,22,37,52 * * * *"
   workflow_dispatch:
   repository_dispatch:
     types: [scan]
