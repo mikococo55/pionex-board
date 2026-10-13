@@ -1,0 +1,376 @@
+# -*- coding: utf-8 -*-
+"""
+派網合約選幣看板
+- 抓派網 (Pionex) 永續合約公開行情，不需要 API Key
+- 4H MACD 判方向，15 分鐘 KDJ 找進場點，4H RSI 過濾過熱/過冷
+- 依 4H ATR 算止損、止盈，並換算成你設定槓桿下的保證金盈虧
+- 每 15 分鐘自動更新一次，結果開在瀏覽器裡
+
+只需要 Python 3.8 以上，不用安裝任何套件。
+這是依規則篩選的工具，不是投資建議；下單請自己在派網 App 確認後執行。
+"""
+
+import json
+import os
+import sys
+import time
+import urllib.request
+import webbrowser
+from datetime import datetime
+
+# ===================== 可以自己改的設定 =====================
+LEVERAGE = 10            # 你打算用的槓桿倍數
+MARGIN_USDT = 100        # 每筆投入的保證金 (USDT)
+MIN_VOLUME_USDT = 5_000_000   # 24 小時成交額門檻，太小的幣不看
+MAX_COINS = 40           # 依成交額取前幾名來分析
+REFRESH_MINUTES = 15     # 幾分鐘更新一次
+SL_ATR_MULT = 1.0        # 止損 = 4H ATR × 這個倍數
+SL_MIN_PCT, SL_MAX_PCT = 1.0, 4.0   # 止損距離上下限 (%)
+TP1_R, TP2_R = 1.5, 2.5  # 止盈 = 止損距離 × 這個倍數
+# ============================================================
+
+API = "https://api.pionex.com"
+OUT_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "派網選幣看板.html")
+if "--out" in sys.argv:                      # 雲端版用：指定輸出位置
+    OUT_FILE = os.path.abspath(sys.argv[sys.argv.index("--out") + 1])
+    os.makedirs(os.path.dirname(OUT_FILE), exist_ok=True)
+CLOUD = "--out" in sys.argv
+
+# 名稱結尾是 X 但其實是加密貨幣的（其餘結尾 X 的多半是股票代幣，排除）
+CRYPTO_ENDING_X = {"IMX", "ZRX", "STRAX", "BEAMX", "FLUX", "TRX", "WAXP", "MINAX", "ONDOX"}
+EXCLUDE = {"USDC", "PAXG", "XAUT", "WBTC", "MBTC", "METH"}
+
+
+def get(path):
+    req = urllib.request.Request(API + path, headers={"User-Agent": "Mozilla/5.0"})
+    with urllib.request.urlopen(req, timeout=15) as r:
+        data = json.loads(r.read().decode("utf-8"))
+    if not data.get("result"):
+        raise RuntimeError(data.get("message", "API 回傳失敗"))
+    return data["data"]
+
+
+def is_stock_token(base):
+    return base.endswith("X") and len(base) >= 4 and base not in CRYPTO_ENDING_X
+
+
+def get_candidates():
+    tickers = get("/api/v1/market/tickers?type=PERP")["tickers"]
+    rows = []
+    for t in tickers:
+        sym = t["symbol"]
+        if not sym.endswith("_USDT_PERP"):
+            continue
+        base = sym.split("_")[0]
+        if base.upper() in EXCLUDE or is_stock_token(base):
+            continue
+        amount = float(t["amount"])
+        if amount < MIN_VOLUME_USDT:
+            continue
+        o, c = float(t["open"]), float(t["close"])
+        rows.append({"symbol": sym, "base": base, "price": c,
+                     "chg": (c - o) / o * 100 if o else 0, "amount": amount})
+    rows.sort(key=lambda r: r["amount"], reverse=True)
+    return rows[:MAX_COINS]
+
+
+def klines(symbol, interval, limit=200):
+    data = get(f"/api/v1/market/klines?symbol={symbol}&interval={interval}&limit={limit}")
+    ks = data["klines"]
+    ks.sort(key=lambda k: k["time"])          # API 回傳新到舊，改成舊到新
+    return ([float(k["high"]) for k in ks], [float(k["low"]) for k in ks],
+            [float(k["close"]) for k in ks])
+
+
+# ----------------------- 指標 -----------------------
+def ema(vals, n):
+    k = 2 / (n + 1)
+    out, e = [], vals[0]
+    for v in vals:
+        e = v * k + e * (1 - k)
+        out.append(e)
+    return out
+
+
+def macd(close):
+    dif = [a - b for a, b in zip(ema(close, 12), ema(close, 26))]
+    dea = ema(dif, 9)
+    hist = [(a - b) * 2 for a, b in zip(dif, dea)]
+    return dif, dea, hist
+
+
+def rsi(close, n=14):
+    gains, losses = 0.0, 0.0
+    for i in range(1, n + 1):
+        d = close[i] - close[i - 1]
+        gains += max(d, 0)
+        losses += max(-d, 0)
+    ag, al = gains / n, losses / n
+    for i in range(n + 1, len(close)):
+        d = close[i] - close[i - 1]
+        ag = (ag * (n - 1) + max(d, 0)) / n
+        al = (al * (n - 1) + max(-d, 0)) / n
+    return 100.0 if al == 0 else 100 - 100 / (1 + ag / al)
+
+
+def kdj(high, low, close, n=9):
+    k = d = 50.0
+    ks, ds, js = [], [], []
+    for i in range(len(close)):
+        lo, hi = min(low[max(0, i - n + 1):i + 1]), max(high[max(0, i - n + 1):i + 1])
+        rsv = 50.0 if hi == lo else (close[i] - lo) / (hi - lo) * 100
+        k = k * 2 / 3 + rsv / 3
+        d = d * 2 / 3 + k / 3
+        ks.append(k); ds.append(d); js.append(3 * k - 2 * d)
+    return ks, ds, js
+
+
+def atr(high, low, close, n=14):
+    trs = [high[0] - low[0]]
+    for i in range(1, len(close)):
+        trs.append(max(high[i] - low[i], abs(high[i] - close[i - 1]), abs(low[i] - close[i - 1])))
+    a = sum(trs[:n]) / n
+    for t in trs[n:]:
+        a = (a * (n - 1) + t) / n
+    return a
+
+
+def boll_pos(close, n=20):
+    seg = close[-n:]
+    mid = sum(seg) / n
+    sd = (sum((x - mid) ** 2 for x in seg) / n) ** 0.5
+    up, dn = mid + 2 * sd, mid - 2 * sd
+    return 50.0 if up == dn else (close[-1] - dn) / (up - dn) * 100
+
+
+# ----------------------- 判斷 -----------------------
+def analyse(coin):
+    h4, l4, c4 = klines(coin["symbol"], "4H")
+    h15, l15, c15 = klines(coin["symbol"], "15M")
+    if len(c4) < 60 or len(c15) < 30:
+        return None
+
+    dif, dea, hist = macd(c4)
+    trend = "多" if dif[-1] > dea[-1] else "空"
+    hist_growing = abs(hist[-1]) > abs(hist[-2])
+    r = rsi(c4)
+    bpos = boll_pos(c4)
+
+    k, d, j = kdj(h15, l15, c15)
+    gold = any(k[-i - 1] <= d[-i - 1] and k[-i] > d[-i] for i in range(1, 4))
+    dead = any(k[-i - 1] >= d[-i - 1] and k[-i] < d[-i] for i in range(1, 4))
+
+    side, entry_ok, note = None, False, []
+    if trend == "多":
+        side = "LONG"
+        entry_ok = gold and k[-1] < 60
+        if r > 75: note.append("4H RSI 過熱")
+        if bpos > 95: note.append("貼近布林上軌")
+    else:
+        side = "SHORT"
+        entry_ok = dead and k[-1] > 40
+        if r < 25: note.append("4H RSI 超賣")
+        if bpos < 5: note.append("貼近布林下軌")
+
+    # 等級
+    if entry_ok and hist_growing and not note:
+        grade, score = "可進場", 3
+    elif entry_ok and not note:
+        grade, score = "可進場（動能轉弱）", 2
+    elif hist_growing and not note:
+        grade, score = "等15分回檔", 1
+    else:
+        grade, score = "觀望", 0
+
+    price = c4[-1]
+    a = atr(h4, l4, c4)
+    sl_pct = min(max(a / price * 100 * SL_ATR_MULT, SL_MIN_PCT), SL_MAX_PCT)
+    sgn = 1 if side == "LONG" else -1
+    sl = price * (1 - sgn * sl_pct / 100)
+    tp1 = price * (1 + sgn * sl_pct * TP1_R / 100)
+    tp2 = price * (1 + sgn * sl_pct * TP2_R / 100)
+    liq_warn = sl_pct * LEVERAGE >= 80   # 止損前就可能接近強平
+
+    return {**coin, "side": side, "grade": grade, "score": score,
+            "dif": dif[-1], "dea": dea[-1], "hist_growing": hist_growing,
+            "rsi": r, "boll": bpos, "k": k[-1], "d": d[-1], "j": j[-1],
+            "gold": gold, "dead": dead, "note": "、".join(note),
+            "entry": price, "sl": sl, "tp1": tp1, "tp2": tp2, "sl_pct": sl_pct,
+            "loss": MARGIN_USDT * sl_pct * LEVERAGE / 100,
+            "win1": MARGIN_USDT * sl_pct * TP1_R * LEVERAGE / 100,
+            "win2": MARGIN_USDT * sl_pct * TP2_R * LEVERAGE / 100,
+            "liq_warn": liq_warn}
+
+
+# ----------------------- 報表 -----------------------
+def fmt_price(p):
+    if p >= 1000: return f"{p:,.1f}"
+    if p >= 1: return f"{p:,.3f}"
+    if p >= 0.01: return f"{p:.5f}"
+    return f"{p:.8f}".rstrip("0")
+
+
+def fmt_amt(a):
+    return f"{a / 1e8:.2f} 億" if a >= 1e8 else f"{a / 1e4:,.0f} 萬"
+
+
+def row_html(r):
+    chg_cls = "up" if r["chg"] >= 0 else "down"
+    grade_cls = {3: "g3", 2: "g2", 1: "g1"}.get(r["score"], "g0")
+    kdj_txt = f'K {r["k"]:.0f} / D {r["d"]:.0f}'
+    if r["side"] == "LONG" and r["gold"]: kdj_txt += " 金叉"
+    if r["side"] == "SHORT" and r["dead"]: kdj_txt += " 死叉"
+    macd_txt = ("DIF>DEA" if r["dif"] > r["dea"] else "DIF<DEA") + (" 柱放大" if r["hist_growing"] else " 柱縮小")
+    warn = ""
+    if r["note"]: warn += f'<div class="warn">{r["note"]}</div>'
+    if r["liq_warn"]: warn += f'<div class="warn">止損距離 {r["sl_pct"]:.1f}% × {LEVERAGE} 倍，接近強平，建議降槓桿</div>'
+    return f"""
+<tr>
+  <td><b class="sym">{r["base"]}</b><div class="sub">{fmt_amt(r["amount"])}</div></td>
+  <td class="num">{fmt_price(r["price"])}<div class="sub {chg_cls}">{r["chg"]:+.2f}%</div></td>
+  <td><span class="pill {grade_cls}">{r["grade"]}</span>{warn}</td>
+  <td class="ind">{macd_txt}<div class="sub">RSI {r["rsi"]:.0f}・布林位置 {r["boll"]:.0f}%</div></td>
+  <td class="ind">{kdj_txt}</td>
+  <td class="num">{fmt_price(r["entry"])}</td>
+  <td class="num down-c">{fmt_price(r["sl"])}<div class="sub">−{r["sl_pct"]:.2f}%・−{r["loss"]:.1f}U</div></td>
+  <td class="num up-c">{fmt_price(r["tp1"])}<div class="sub">+{r["win1"]:.1f}U</div></td>
+  <td class="num up-c">{fmt_price(r["tp2"])}<div class="sub">+{r["win2"]:.1f}U</div></td>
+</tr>"""
+
+
+def table_html(title, rows, side_cls):
+    if not rows:
+        return f'<section><h2 class="{side_cls}">{title}</h2><p class="empty">目前沒有符合條件的幣</p></section>'
+    return f"""
+<section>
+  <h2 class="{side_cls}">{title}<span class="count">{len(rows)}</span></h2>
+  <div class="scroll"><table>
+    <thead><tr><th>幣種 / 成交額</th><th>現價 / 24h</th><th>判斷</th><th>4H MACD</th>
+    <th>15分 KDJ</th><th>進場</th><th>止損</th><th>止盈1</th><th>止盈2</th></tr></thead>
+    <tbody>{"".join(row_html(r) for r in rows)}</tbody>
+  </table></div>
+</section>"""
+
+
+def build_html(results, errors, btc):
+    longs = sorted([r for r in results if r["side"] == "LONG" and r["score"] > 0],
+                   key=lambda r: (-r["score"], -r["amount"]))
+    shorts = sorted([r for r in results if r["side"] == "SHORT" and r["score"] > 0],
+                    key=lambda r: (-r["score"], -r["amount"]))
+    watch = [r for r in results if r["score"] == 0]
+    from datetime import timezone, timedelta
+    now = datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%d %H:%M")   # 台灣時間
+    btc_txt = ""
+    if btc:
+        cls = "up" if btc["chg"] >= 0 else "down"
+        btc_txt = f'BTC {fmt_price(btc["price"])} <span class="{cls}">{btc["chg"]:+.2f}%</span>・4H 趨勢偏{"多" if btc["side"]=="LONG" else "空"}'
+    err_txt = f'<p class="sub">{len(errors)} 個幣抓取失敗已略過</p>' if errors else ""
+    watch_txt = "、".join(f'{r["base"]}（{"多" if r["side"]=="LONG" else "空"}）' for r in watch) or "無"
+
+    return f"""<!doctype html><html lang="zh-Hant"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta http-equiv="refresh" content="{REFRESH_MINUTES * 60}">
+<title>派網選幣看板</title>
+<style>
+:root {{ --bg:#f5f6f4; --panel:#ffffff; --fg:#1b1f1d; --muted:#6b736e; --line:#dfe3df;
+  --up:#0f8a5f; --down:#c8372d; --amber:#b7791f; --accent:#2b5c8a; }}
+@media (prefers-color-scheme: dark) {{ :root {{ --bg:#111513; --panel:#181d1b; --fg:#e6ebe8; --muted:#8f9a94;
+  --line:#2a322e; --up:#3ccf8e; --down:#ff6b5e; --amber:#e3a83a; --accent:#7fb2e5; color-scheme:dark; }} }}
+* {{ box-sizing:border-box; }}
+body {{ margin:0; background:var(--bg); color:var(--fg);
+  font:14px/1.5 "Noto Sans TC","Microsoft JhengHei",system-ui,sans-serif; padding:24px 16px 48px; }}
+.wrap {{ max-width:1200px; margin:0 auto; display:flex; flex-direction:column; gap:24px; }}
+header {{ display:flex; flex-wrap:wrap; justify-content:space-between; align-items:baseline; gap:8px 24px; }}
+h1 {{ margin:0; font-size:22px; letter-spacing:.02em; }}
+.meta {{ color:var(--muted); font-size:13px; display:flex; flex-direction:column; gap:2px; }}
+.settings {{ background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:10px 14px;
+  font-size:13px; color:var(--muted); display:flex; flex-wrap:wrap; gap:6px 20px; }}
+.settings b {{ color:var(--fg); font-variant-numeric:tabular-nums; }}
+h2 {{ font-size:16px; margin:0 0 10px; display:flex; align-items:center; gap:8px; }}
+h2.long {{ color:var(--up); }} h2.short {{ color:var(--down); }}
+.count {{ font-size:12px; color:var(--muted); font-weight:400; }}
+.scroll {{ overflow-x:auto; background:var(--panel); border:1px solid var(--line); border-radius:8px; }}
+table {{ border-collapse:collapse; width:100%; min-width:960px; }}
+th, td {{ padding:10px 12px; text-align:left; vertical-align:top; border-bottom:1px solid var(--line); }}
+th {{ font-size:12px; color:var(--muted); font-weight:500; white-space:nowrap; }}
+tr:last-child td {{ border-bottom:0; }}
+.num {{ font-variant-numeric:tabular-nums; text-align:right; white-space:nowrap; }}
+th:nth-child(n+6), th:nth-child(2) {{ text-align:right; }}
+.sym {{ font-size:15px; }} .sub {{ font-size:12px; color:var(--muted); }}
+.ind {{ font-size:13px; white-space:nowrap; }}
+.up {{ color:var(--up); }} .down {{ color:var(--down); }}
+.up-c {{ color:var(--up); }} .down-c {{ color:var(--down); }}
+.up-c .sub, .down-c .sub {{ color:inherit; opacity:.8; }}
+.pill {{ display:inline-block; padding:2px 8px; border-radius:999px; font-size:12px; white-space:nowrap; border:1px solid currentColor; }}
+.g3 {{ color:var(--up); background:color-mix(in srgb, var(--up) 12%, transparent); }}
+.g2 {{ color:var(--accent); }} .g1 {{ color:var(--amber); }} .g0 {{ color:var(--muted); }}
+.warn {{ color:var(--amber); font-size:12px; margin-top:4px; }}
+.empty {{ color:var(--muted); background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:16px; margin:0; }}
+.legend {{ color:var(--muted); font-size:13px; line-height:1.8; }}
+.legend b {{ color:var(--fg); }}
+</style></head><body><div class="wrap">
+<header>
+  <h1>派網選幣看板</h1>
+  <div class="meta"><span>更新時間 {now}・每 {REFRESH_MINUTES} 分鐘自動更新</span><span>{btc_txt}</span></div>
+</header>
+<div class="settings">
+  <span>槓桿 <b>{LEVERAGE}x</b></span><span>每筆保證金 <b>{MARGIN_USDT} U</b></span>
+  <span>成交額門檻 <b>{fmt_amt(MIN_VOLUME_USDT)}</b></span><span>分析 <b>{len(results)}</b> 個幣</span>
+  <span>止損 <b>4H ATR×{SL_ATR_MULT}</b>（{SL_MIN_PCT}%–{SL_MAX_PCT}%）</span><span>止盈 <b>{TP1_R}R / {TP2_R}R</b></span>
+</div>
+{err_txt}
+{table_html("做多候選", longs, "long")}
+{table_html("做空候選", shorts, "short")}
+<section><h2>觀望（方向有但條件不足或過熱過冷）</h2><p class="legend">{watch_txt}</p></section>
+<section class="legend">
+  <b>判斷規則</b><br>
+  方向：4H MACD 的 DIF 在 DEA 之上做多、之下做空。<br>
+  <b>可進場</b>：15 分 KDJ 近 3 根內順方向交叉（做多金叉且 K&lt;60，做空死叉且 K&gt;40），4H 柱體放大，RSI 不過熱過冷。<br>
+  <b>可進場（動能轉弱）</b>：有進場交叉，但 4H 柱體在縮小，倉位放小一點。<br>
+  <b>等15分回檔</b>：4H 方向明確，15 分還沒給交叉，先掛單等。<br>
+  進場價為目前價格；止損、止盈與盈虧是依你的槓桿和保證金換算，未扣手續費與資金費率。<br>
+  這是規則篩選結果，不是投資建議；下單前請在派網確認價格並自行判斷。
+</section>
+</div></body></html>"""
+
+
+def run_once():
+    print(f"[{datetime.now():%H:%M}] 抓取行情中…")
+    coins = get_candidates()
+    results, errors = [], []
+    for i, c in enumerate(coins, 1):
+        try:
+            r = analyse(c)
+            if r: results.append(r)
+        except Exception as e:
+            errors.append((c["symbol"], str(e)))
+        print(f"  {i}/{len(coins)} {c['base']}", end="\r")
+        time.sleep(0.25)   # 派網限制每秒 10 次，放慢一點
+    btc = next((r for r in results if r["base"] == "BTC"), None)
+    with open(OUT_FILE, "w", encoding="utf-8") as f:
+        f.write(build_html(results, errors, btc))
+    n_long = sum(1 for r in results if r["side"] == "LONG" and r["score"] >= 2)
+    n_short = sum(1 for r in results if r["side"] == "SHORT" and r["score"] >= 2)
+    print(f"\n  完成：可進場做多 {n_long} 個、做空 {n_short} 個 → {OUT_FILE}")
+
+
+def main():
+    first = True
+    while True:
+        try:
+            run_once()
+            if first and not CLOUD:
+                webbrowser.open("file://" + OUT_FILE.replace("\\", "/"))
+                first = False
+        except Exception as e:
+            print("  抓取失敗：", e, "（下一輪再試）")
+            if CLOUD:
+                sys.exit(1)
+        if "--once" in sys.argv or CLOUD:
+            break
+        print(f"  {REFRESH_MINUTES} 分鐘後更新，關掉這個視窗就停止。")
+        time.sleep(REFRESH_MINUTES * 60)
+
+
+if __name__ == "__main__":
+    main()
