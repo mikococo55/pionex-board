@@ -4,6 +4,8 @@ on:
   schedule:
     - cron: "7,22,37,52 * * * *"
   workflow_dispatch:
+  repository_dispatch:
+    types: [scan]
 
 permissions:
   contents: read
@@ -25,7 +27,9 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      - name: 抓行情、產生看板
+      - name: 抓行情、產生看板、傳通知
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
         run: python pionex_scanner.py --out site/index.html
       - uses: actions/upload-pages-artifact@v3
         with:
