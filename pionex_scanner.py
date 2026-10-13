@@ -2,7 +2,8 @@
 """
 派網合約選幣看板
 - 抓派網 (Pionex) 永續合約公開行情，不需要 API Key
-- 4H MACD 判方向，15 分鐘 KDJ 找進場點，4H RSI 過濾過熱/過冷
+- 4H MACD 判方向，1 小時 KDJ 找進場點，4H RSI 過濾過熱/過冷，只做 4H 柱體放大的強訊號
+- 指定的幣出現可進場訊號時，傳 Telegram 通知
 - 依 4H ATR 算止損、止盈，並換算成你設定槓桿下的保證金盈虧
 - 每 15 分鐘自動更新一次，結果開在瀏覽器裡
 
@@ -16,11 +17,15 @@ import sys
 import time
 import urllib.request
 import webbrowser
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 
 # ===================== 可以自己改的設定 =====================
-LEVERAGE = 10            # 你打算用的槓桿倍數
-MARGIN_USDT = 100        # 每筆投入的保證金 (USDT)
+LEVERAGE = 3             # 你打算用的槓桿倍數
+MARGIN_USDT = 50         # 每筆投入的保證金 (USDT)
+ENTRY_TF, ENTRY_TF_MIN = "60M", 60   # 進場週期：1 小時
+NOTIFY_COINS = {"BTC"}   # 哪些幣出現可進場時要傳 Telegram（回測過的才放進來）
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "7526307552")
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")   # 放在 GitHub Secrets，不要寫在這裡
 MIN_VOLUME_USDT = 5_000_000   # 24 小時成交額門檻，太小的幣不看
 MAX_COINS = 40           # 依成交額取前幾名來分析
 REFRESH_MINUTES = 15     # 幾分鐘更新一次
@@ -78,8 +83,8 @@ def klines(symbol, interval, limit=200):
     data = get(f"/api/v1/market/klines?symbol={symbol}&interval={interval}&limit={limit}")
     ks = data["klines"]
     ks.sort(key=lambda k: k["time"])          # API 回傳新到舊，改成舊到新
-    return ([float(k["high"]) for k in ks], [float(k["low"]) for k in ks],
-            [float(k["close"]) for k in ks])
+    return ([int(k["time"]) for k in ks], [float(k["high"]) for k in ks],
+            [float(k["low"]) for k in ks], [float(k["close"]) for k in ks])
 
 
 # ----------------------- 指標 -----------------------
@@ -145,10 +150,16 @@ def boll_pos(close, n=20):
 
 # ----------------------- 判斷 -----------------------
 def analyse(coin):
-    h4, l4, c4 = klines(coin["symbol"], "4H")
-    h15, l15, c15 = klines(coin["symbol"], "15M")
+    _, h4, l4, c4 = klines(coin["symbol"], "4H")
+    t1, h15, l15, c15 = klines(coin["symbol"], ENTRY_TF)
+    now_ms = int(time.time() * 1000)
+    tf_ms = ENTRY_TF_MIN * 60_000
+    if t1 and t1[-1] + tf_ms > now_ms:        # 最後一根還沒收盤，不算
+        t1, h15, l15, c15 = t1[:-1], h15[:-1], l15[:-1], c15[:-1]
     if len(c4) < 60 or len(c15) < 30:
         return None
+    bar_close_ms = t1[-1] + tf_ms
+    fresh = now_ms - bar_close_ms < REFRESH_MINUTES * 60_000   # 這次才剛收盤的訊號
 
     dif, dea, hist = macd(c4)
     trend = "多" if dif[-1] > dea[-1] else "空"
@@ -157,8 +168,8 @@ def analyse(coin):
     bpos = boll_pos(c4)
 
     k, d, j = kdj(h15, l15, c15)
-    gold = any(k[-i - 1] <= d[-i - 1] and k[-i] > d[-i] for i in range(1, 4))
-    dead = any(k[-i - 1] >= d[-i - 1] and k[-i] < d[-i] for i in range(1, 4))
+    gold = k[-2] <= d[-2] and k[-1] > d[-1]   # 最近一根收盤的 1H K 線剛交叉（和回測一致）
+    dead = k[-2] >= d[-2] and k[-1] < d[-1]
 
     side, entry_ok, note = None, False, []
     if trend == "多":
@@ -176,13 +187,13 @@ def analyse(coin):
     if entry_ok and hist_growing and not note:
         grade, score = "可進場", 3
     elif entry_ok and not note:
-        grade, score = "可進場（動能轉弱）", 2
+        grade, score = "動能轉弱（不做）", 2
     elif hist_growing and not note:
-        grade, score = "等15分回檔", 1
+        grade, score = "等1H交叉", 1
     else:
         grade, score = "觀望", 0
 
-    price = c4[-1]
+    price = c15[-1]
     a = atr(h4, l4, c4)
     sl_pct = min(max(a / price * 100 * SL_ATR_MULT, SL_MIN_PCT), SL_MAX_PCT)
     sgn = 1 if side == "LONG" else -1
@@ -199,7 +210,8 @@ def analyse(coin):
             "loss": MARGIN_USDT * sl_pct * LEVERAGE / 100,
             "win1": MARGIN_USDT * sl_pct * TP1_R * LEVERAGE / 100,
             "win2": MARGIN_USDT * sl_pct * TP2_R * LEVERAGE / 100,
-            "liq_warn": liq_warn}
+            "liq_warn": liq_warn, "fresh": fresh,
+            "bar_time": datetime.fromtimestamp(bar_close_ms / 1000, timezone(timedelta(hours=8))).strftime("%m/%d %H:%M")}
 
 
 # ----------------------- 報表 -----------------------
@@ -246,7 +258,7 @@ def table_html(title, rows, side_cls):
   <h2 class="{side_cls}">{title}<span class="count">{len(rows)}</span></h2>
   <div class="scroll"><table>
     <thead><tr><th>幣種 / 成交額</th><th>現價 / 24h</th><th>判斷</th><th>4H MACD</th>
-    <th>15分 KDJ</th><th>進場</th><th>止損</th><th>止盈1</th><th>止盈2</th></tr></thead>
+    <th>1H KDJ</th><th>進場</th><th>止損</th><th>止盈1</th><th>止盈2</th></tr></thead>
     <tbody>{"".join(row_html(r) for r in rows)}</tbody>
   </table></div>
 </section>"""
@@ -258,7 +270,6 @@ def build_html(results, errors, btc):
     shorts = sorted([r for r in results if r["side"] == "SHORT" and r["score"] > 0],
                     key=lambda r: (-r["score"], -r["amount"]))
     watch = [r for r in results if r["score"] == 0]
-    from datetime import timezone, timedelta
     now = datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%d %H:%M")   # 台灣時間
     btc_txt = ""
     if btc:
@@ -325,13 +336,41 @@ th:nth-child(n+6), th:nth-child(2) {{ text-align:right; }}
 <section class="legend">
   <b>判斷規則</b><br>
   方向：4H MACD 的 DIF 在 DEA 之上做多、之下做空。<br>
-  <b>可進場</b>：15 分 KDJ 近 3 根內順方向交叉（做多金叉且 K&lt;60，做空死叉且 K&gt;40），4H 柱體放大，RSI 不過熱過冷。<br>
-  <b>可進場（動能轉弱）</b>：有進場交叉，但 4H 柱體在縮小，倉位放小一點。<br>
-  <b>等15分回檔</b>：4H 方向明確，15 分還沒給交叉，先掛單等。<br>
+  <b>可進場</b>：最近收盤的 1H K 線 KDJ 順方向交叉（做多金叉且 K&lt;60，做空死叉且 K&gt;40），4H 柱體放大，RSI 不過熱過冷。和 TradingView 回測的策略一致。<br>
+  <b>動能轉弱（不做）</b>：有交叉，但 4H 柱體在縮小，策略不進場。<br>
+  <b>等1H交叉</b>：4H 方向明確且動能放大，1H 還沒給交叉，先觀察。<br>
+  Telegram 通知的幣：{"、".join(sorted(NOTIFY_COINS))}。<br>
   進場價為目前價格；止損、止盈與盈虧是依你的槓桿和保證金換算，未扣手續費與資金費率。<br>
   這是規則篩選結果，不是投資建議；下單前請在派網確認價格並自行判斷。
 </section>
 </div></body></html>"""
+
+
+def send_telegram(text):
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        return False
+    body = json.dumps({"chat_id": TELEGRAM_CHAT_ID, "text": text}).encode("utf-8")
+    req = urllib.request.Request(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+                                 data=body, headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=15) as r:
+            return json.loads(r.read().decode("utf-8")).get("ok", False)
+    except Exception as e:
+        print("  Telegram 傳送失敗：", e)
+        return False
+
+
+def signal_text(r):
+    side = "做多 🟢" if r["side"] == "LONG" else "做空 🔴"
+    warn = "\n⚠ 止損接近強平，請降槓桿" if r["liq_warn"] else ""
+    return (f"【派網訊號】{r['base']} {side}\n"
+            f"1H K 線收盤：{r['bar_time']}\n"
+            f"進場：{fmt_price(r['entry'])}\n"
+            f"止損：{fmt_price(r['sl'])}（-{r['sl_pct']:.2f}%，約 -{r['loss']:.1f}U）\n"
+            f"止盈1：{fmt_price(r['tp1'])}（約 +{r['win1']:.1f}U，平一半）\n"
+            f"止盈2：{fmt_price(r['tp2'])}（約 +{r['win2']:.1f}U）\n"
+            f"以 {LEVERAGE} 倍、{MARGIN_USDT}U 計算{warn}\n"
+            f"下單前請在派網確認價格。")
 
 
 def run_once():
@@ -352,6 +391,14 @@ def run_once():
     n_long = sum(1 for r in results if r["side"] == "LONG" and r["score"] >= 2)
     n_short = sum(1 for r in results if r["side"] == "SHORT" and r["score"] >= 2)
     print(f"\n  完成：可進場做多 {n_long} 個、做空 {n_short} 個 → {OUT_FILE}")
+    for r in results:
+        if r["base"] in NOTIFY_COINS and r["score"] == 3 and r["fresh"]:
+            ok = send_telegram(signal_text(r))
+            print(f"  已傳 Telegram：{r['base']} {r['side']}" if ok else "  Telegram 未傳送（沒有設定或失敗）")
+    if os.environ.get("GITHUB_EVENT_NAME") == "workflow_dispatch":      # 手動執行時傳一則測試訊息
+        lines = [f"{r['base']}：4H 偏{'多' if r['side']=='LONG' else '空'}・{r['grade']}"
+                 for r in results if r["base"] in NOTIFY_COINS]
+        send_telegram("✅ 看板手動更新完成，通知功能正常\n" + ("\n".join(lines) or "（指定的幣不在名單內）"))
 
 
 def main():
