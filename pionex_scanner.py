@@ -23,7 +23,8 @@ from datetime import datetime, timezone, timedelta
 LEVERAGE = 3             # 你打算用的槓桿倍數
 MARGIN_USDT = 50         # 每筆投入的保證金 (USDT)
 ENTRY_TF, ENTRY_TF_MIN = "60M", 60   # 進場週期：1 小時
-NOTIFY_COINS = {"BTC"}   # 哪些幣出現可進場時要傳 Telegram（回測過的才放進來）
+NOTIFY_COINS = "ALL"     # "ALL" = 看板上所有可進場的幣都通知；只想收部分可改成 {"BTC", "ETH"}
+TESTED_COINS = {"BTC"}   # 回測過、表現合格的幣（通知裡會標示）
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "7526307552")
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")   # 放在 GitHub Secrets，不要寫在這裡
 MIN_VOLUME_USDT = 5_000_000   # 24 小時成交額門檻，太小的幣不看
@@ -339,7 +340,7 @@ th:nth-child(n+6), th:nth-child(2) {{ text-align:right; }}
   <b>可進場</b>：最近收盤的 1H K 線 KDJ 順方向交叉（做多金叉且 K&lt;60，做空死叉且 K&gt;40），4H 柱體放大，RSI 不過熱過冷。和 TradingView 回測的策略一致。<br>
   <b>動能轉弱（不做）</b>：有交叉，但 4H 柱體在縮小，策略不進場。<br>
   <b>等1H交叉</b>：4H 方向明確且動能放大，1H 還沒給交叉，先觀察。<br>
-  Telegram 通知的幣：{"、".join(sorted(NOTIFY_COINS))}。<br>
+  Telegram 通知：{"所有可進場的幣" if NOTIFY_COINS == "ALL" else "、".join(sorted(NOTIFY_COINS))}；回測合格：{"、".join(sorted(TESTED_COINS))}。<br>
   進場價為目前價格；止損、止盈與盈虧是依你的槓桿和保證金換算，未扣手續費與資金費率。<br>
   這是規則篩選結果，不是投資建議；下單前請在派網確認價格並自行判斷。
 </section>
@@ -363,7 +364,9 @@ def send_telegram(text):
 def signal_text(r):
     side = "做多 🟢" if r["side"] == "LONG" else "做空 🔴"
     warn = "\n⚠ 止損接近強平，請降槓桿" if r["liq_warn"] else ""
+    tested = "✅ 已回測合格" if r["base"] in TESTED_COINS else "⚠ 尚未回測，請謹慎"
     return (f"【派網訊號】{r['base']} {side}\n"
+            f"{tested}\n"
             f"1H K 線收盤：{r['bar_time']}\n"
             f"進場：{fmt_price(r['entry'])}\n"
             f"止損：{fmt_price(r['sl'])}（-{r['sl_pct']:.2f}%，約 -{r['loss']:.1f}U）\n"
@@ -392,12 +395,14 @@ def run_once():
     n_short = sum(1 for r in results if r["side"] == "SHORT" and r["score"] >= 2)
     print(f"\n  完成：可進場做多 {n_long} 個、做空 {n_short} 個 → {OUT_FILE}")
     for r in results:
-        if r["base"] in NOTIFY_COINS and r["score"] == 3 and r["fresh"]:
+        if (NOTIFY_COINS == "ALL" or r["base"] in NOTIFY_COINS) and r["score"] == 3 and r["fresh"]:
             ok = send_telegram(signal_text(r))
             print(f"  已傳 Telegram：{r['base']} {r['side']}" if ok else "  Telegram 未傳送（沒有設定或失敗）")
     if os.environ.get("GITHUB_EVENT_NAME") == "workflow_dispatch":      # 手動執行時傳一則測試訊息
         lines = [f"{r['base']}：4H 偏{'多' if r['side']=='LONG' else '空'}・{r['grade']}"
-                 for r in results if r["base"] in NOTIFY_COINS]
+                 for r in results if r["base"] in TESTED_COINS]
+        n_ok = sum(1 for r in results if r["score"] == 3)
+        lines.append(f"目前看板可進場：{n_ok} 個")
         send_telegram("✅ 看板手動更新完成，通知功能正常\n" + ("\n".join(lines) or "（指定的幣不在名單內）"))
 
 
