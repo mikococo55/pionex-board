@@ -20,15 +20,19 @@ import webbrowser
 from datetime import datetime, timezone, timedelta
 
 # ===================== 可以自己改的設定 =====================
-LEVERAGE = 3             # 你打算用的槓桿倍數
-MARGIN_USDT = 50         # 每筆投入的保證金 (USDT)
+LEVERAGE = 40            # 你打算用的槓桿倍數
+MARGIN_USDT = 30         # 每筆投入的保證金 (USDT)
+MAX_RISK_PCT = 50        # 單筆止損最多虧掉保證金的幾 %（用來算建議最高槓桿）
+GRID_STEP_PCT = 0.3      # 網格每格間距約幾 %（太小會被手續費吃掉）
+GRID_PAD_PCT = 0.2       # 網格區間在進場價外多留幾 %
+PENDING_MARGIN = 15      # 「等1H交叉」預先掛單建議投入的 U（沒確認過的進場，金額小一點）
 ENTRY_TF, ENTRY_TF_MIN = "60M", 60   # 進場週期：1 小時
 NOTIFY_COINS = "ALL"     # "ALL" = 看板上所有可進場的幣都通知；只想收部分可改成 {"BTC", "ETH"}
 TESTED_COINS = {"BTC"}   # 回測過、表現合格的幣（通知裡會標示）
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "7526307552")
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")   # 放在 GitHub Secrets，不要寫在這裡
-MIN_VOLUME_USDT = 5_000_000   # 24 小時成交額門檻，太小的幣不看
-MAX_COINS = 40           # 依成交額取前幾名來分析
+MIN_VOLUME_USDT = 2_000_000   # 24 小時成交額門檻，太小的幣不看
+MAX_COINS = 150          # 依成交額取前幾名來分析
 REFRESH_MINUTES = 15     # 幾分鐘更新一次
 SL_ATR_MULT = 1.0        # 止損 = 4H ATR × 這個倍數
 SL_MIN_PCT, SL_MAX_PCT = 1.0, 4.0   # 止損距離上下限 (%)
@@ -201,7 +205,27 @@ def analyse(coin):
     sl = price * (1 - sgn * sl_pct / 100)
     tp1 = price * (1 + sgn * sl_pct * TP1_R / 100)
     tp2 = price * (1 + sgn * sl_pct * TP2_R / 100)
-    liq_warn = sl_pct * LEVERAGE >= 80   # 止損前就可能接近強平
+    max_lev = max(1, int(MAX_RISK_PCT // sl_pct))   # 止損時最多虧 MAX_RISK_PCT% 的建議最高槓桿
+    liq_warn = LEVERAGE > max_lev
+
+    # 「等1H交叉」的建議掛單價：等價格回檔到 1H 布林中軌附近再進場
+    pend = None
+    if score == 1:
+        mid = sum(c15[-20:]) / 20
+        if side == "SHORT":
+            lim = max(mid, price * 1.003)            # 至少比現價高 0.3%
+            lim = min(lim, max(h15[-12:]))           # 不超過近 12 小時高點
+            if lim <= price: lim = price * 1.003
+        else:
+            lim = min(mid, price * 0.997)            # 至少比現價低 0.3%
+            lim = max(lim, min(l15[-12:]))           # 不低於近 12 小時低點
+            if lim >= price: lim = price * 0.997
+        pend = {"price": lim,
+                "sl": lim * (1 - sgn * sl_pct / 100),
+                "tp1": lim * (1 + sgn * sl_pct * TP1_R / 100),
+                "tp2": lim * (1 + sgn * sl_pct * TP2_R / 100),
+                "dist": (lim - price) / price * 100,
+                "loss": PENDING_MARGIN * sl_pct * LEVERAGE / 100}
 
     return {**coin, "side": side, "grade": grade, "score": score,
             "dif": dif[-1], "dea": dea[-1], "hist_growing": hist_growing,
@@ -211,7 +235,7 @@ def analyse(coin):
             "loss": MARGIN_USDT * sl_pct * LEVERAGE / 100,
             "win1": MARGIN_USDT * sl_pct * TP1_R * LEVERAGE / 100,
             "win2": MARGIN_USDT * sl_pct * TP2_R * LEVERAGE / 100,
-            "liq_warn": liq_warn, "fresh": fresh,
+            "liq_warn": liq_warn, "max_lev": max_lev, "fresh": fresh, "pend": pend,
             "bar_time": datetime.fromtimestamp(bar_close_ms / 1000, timezone(timedelta(hours=8))).strftime("%m/%d %H:%M")}
 
 
@@ -236,10 +260,16 @@ def row_html(r):
     macd_txt = ("DIF>DEA" if r["dif"] > r["dea"] else "DIF<DEA") + (" 柱放大" if r["hist_growing"] else " 柱縮小")
     warn = ""
     if r["note"]: warn += f'<div class="warn">{r["note"]}</div>'
-    if r["liq_warn"]: warn += f'<div class="warn">止損距離 {r["sl_pct"]:.1f}% × {LEVERAGE} 倍，接近強平，建議降槓桿</div>'
+    if r["liq_warn"]: warn += f'<div class="warn">止損 {r["sl_pct"]:.1f}%，{LEVERAGE} 倍風險偏高，建議最高 {r["max_lev"]} 倍</div>'
+    pd = r.get("pend")
+    if pd:
+        act = "限價賣出（開空）" if r["side"] == "SHORT" else "限價買入（開多）"
+        warn += (f'<div class="pend"><b>建議掛單</b> {act} <b>{fmt_price(pd["price"])}</b>'
+                 f'（距現價 {pd["dist"]:+.2f}%）<br>止損 {fmt_price(pd["sl"])}・止盈1 {fmt_price(pd["tp1"])}'
+                 f'・止盈2 {fmt_price(pd["tp2"])}<br>{PENDING_MARGIN}U・{LEVERAGE} 倍，止損約 -{pd["loss"]:.1f}U</div>')
     return f"""
 <tr>
-  <td><b class="sym">{r["base"]}</b><div class="sub">{fmt_amt(r["amount"])}</div></td>
+  <td><b class="sym">{r["base"]}</b> <span class="dir {'up' if r['side']=='LONG' else 'down'}">{'做多' if r['side']=='LONG' else '做空'}</span><div class="sub">{fmt_amt(r["amount"])}</div></td>
   <td class="num">{fmt_price(r["price"])}<div class="sub {chg_cls}">{r["chg"]:+.2f}%</div></td>
   <td><span class="pill {grade_cls}">{r["grade"]}</span>{warn}</td>
   <td class="ind">{macd_txt}<div class="sub">RSI {r["rsi"]:.0f}・布林位置 {r["boll"]:.0f}%</div></td>
@@ -258,7 +288,7 @@ def table_html(title, rows, side_cls):
 <section>
   <h2 class="{side_cls}">{title}<span class="count">{len(rows)}</span></h2>
   <div class="scroll"><table>
-    <thead><tr><th>幣種 / 成交額</th><th>現價 / 24h</th><th>判斷</th><th>4H MACD</th>
+    <thead><tr><th>幣種 / 方向 / 成交額</th><th>現價 / 24h</th><th>判斷</th><th>4H MACD</th>
     <th>1H KDJ</th><th>進場</th><th>止損</th><th>止盈1</th><th>止盈2</th></tr></thead>
     <tbody>{"".join(row_html(r) for r in rows)}</tbody>
   </table></div>
@@ -266,18 +296,14 @@ def table_html(title, rows, side_cls):
 
 
 def build_html(results, errors, btc):
-    longs = sorted([r for r in results if r["side"] == "LONG" and r["score"] > 0],
-                   key=lambda r: (-r["score"], -r["amount"]))
-    shorts = sorted([r for r in results if r["side"] == "SHORT" and r["score"] > 0],
-                    key=lambda r: (-r["score"], -r["amount"]))
-    watch = [r for r in results if r["score"] == 0]
+    ready = sorted([r for r in results if r["score"] == 3], key=lambda r: -r["amount"])
+    pending = sorted([r for r in results if r["score"] == 1], key=lambda r: -r["amount"])
     now = datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%d %H:%M")   # 台灣時間
     btc_txt = ""
     if btc:
         cls = "up" if btc["chg"] >= 0 else "down"
         btc_txt = f'BTC {fmt_price(btc["price"])} <span class="{cls}">{btc["chg"]:+.2f}%</span>・4H 趨勢偏{"多" if btc["side"]=="LONG" else "空"}'
     err_txt = f'<p class="sub">{len(errors)} 個幣抓取失敗已略過</p>' if errors else ""
-    watch_txt = "、".join(f'{r["base"]}（{"多" if r["side"]=="LONG" else "空"}）' for r in watch) or "無"
 
     return f"""<!doctype html><html lang="zh-Hant"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
@@ -299,7 +325,7 @@ h1 {{ margin:0; font-size:22px; letter-spacing:.02em; }}
   font-size:13px; color:var(--muted); display:flex; flex-wrap:wrap; gap:6px 20px; }}
 .settings b {{ color:var(--fg); font-variant-numeric:tabular-nums; }}
 h2 {{ font-size:16px; margin:0 0 10px; display:flex; align-items:center; gap:8px; }}
-h2.long {{ color:var(--up); }} h2.short {{ color:var(--down); }}
+h2.long {{ color:var(--up); }} h2.short {{ color:var(--down); }} h2.pend-h {{ color:var(--accent); }}
 .count {{ font-size:12px; color:var(--muted); font-weight:400; }}
 .scroll {{ overflow-x:auto; background:var(--panel); border:1px solid var(--line); border-radius:8px; }}
 table {{ border-collapse:collapse; width:100%; min-width:960px; }}
@@ -308,7 +334,7 @@ th {{ font-size:12px; color:var(--muted); font-weight:500; white-space:nowrap; }
 tr:last-child td {{ border-bottom:0; }}
 .num {{ font-variant-numeric:tabular-nums; text-align:right; white-space:nowrap; }}
 th:nth-child(n+6), th:nth-child(2) {{ text-align:right; }}
-.sym {{ font-size:15px; }} .sub {{ font-size:12px; color:var(--muted); }}
+.sym {{ font-size:15px; }} .dir {{ font-size:12px; font-weight:700; margin-left:4px; }} .sub {{ font-size:12px; color:var(--muted); }}
 .ind {{ font-size:13px; white-space:nowrap; }}
 .up {{ color:var(--up); }} .down {{ color:var(--down); }}
 .up-c {{ color:var(--up); }} .down-c {{ color:var(--down); }}
@@ -317,6 +343,7 @@ th:nth-child(n+6), th:nth-child(2) {{ text-align:right; }}
 .g3 {{ color:var(--up); background:color-mix(in srgb, var(--up) 12%, transparent); }}
 .g2 {{ color:var(--accent); }} .g1 {{ color:var(--amber); }} .g0 {{ color:var(--muted); }}
 .warn {{ color:var(--amber); font-size:12px; margin-top:4px; }}
+.pend {{ font-size:12px; margin-top:6px; padding:6px 8px; border-radius:6px; background:color-mix(in srgb, var(--accent) 10%, transparent); color:var(--fg); line-height:1.6; white-space:nowrap; }}
 .empty {{ color:var(--muted); background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:16px; margin:0; }}
 .legend {{ color:var(--muted); font-size:13px; line-height:1.8; }}
 .legend b {{ color:var(--fg); }}
@@ -331,15 +358,14 @@ th:nth-child(n+6), th:nth-child(2) {{ text-align:right; }}
   <span>止損 <b>4H ATR×{SL_ATR_MULT}</b>（{SL_MIN_PCT}%–{SL_MAX_PCT}%）</span><span>止盈 <b>{TP1_R}R / {TP2_R}R</b></span>
 </div>
 {err_txt}
-{table_html("做多候選", longs, "long")}
-{table_html("做空候選", shorts, "short")}
-<section><h2>觀望（方向有但條件不足或過熱過冷）</h2><p class="legend">{watch_txt}</p></section>
+{table_html("可進場", ready, "long")}
+{table_html("可預先掛單（等1H交叉）", pending, "pend-h")}
 <section class="legend">
   <b>判斷規則</b><br>
   方向：4H MACD 的 DIF 在 DEA 之上做多、之下做空。<br>
   <b>可進場</b>：最近收盤的 1H K 線 KDJ 順方向交叉（做多金叉且 K&lt;60，做空死叉且 K&gt;40），4H 柱體放大，RSI 不過熱過冷。和 TradingView 回測的策略一致。<br>
   <b>動能轉弱（不做）</b>：有交叉，但 4H 柱體在縮小，策略不進場。<br>
-  <b>等1H交叉</b>：4H 方向明確且動能放大，1H 還沒給交叉，先觀察。<br>
+  <b>等1H交叉</b>：4H 方向明確且動能放大，1H 還沒給交叉。可照「建議掛單」預先掛限價單：做空掛在現價上方、做多掛在現價下方（約 1H 布林中軌），掛單時一起設好止損止盈。這種進場沒經過回測，金額建議小一點。<br>
   Telegram 通知：{"所有可進場的幣" if NOTIFY_COINS == "ALL" else "、".join(sorted(NOTIFY_COINS))}；回測合格：{"、".join(sorted(TESTED_COINS))}。<br>
   進場價為目前價格；止損、止盈與盈虧是依你的槓桿和保證金換算，未扣手續費與資金費率。<br>
   這是規則篩選結果，不是投資建議；下單前請在派網確認價格並自行判斷。
@@ -361,18 +387,44 @@ def send_telegram(text):
         return False
 
 
+def grid_plan(r):
+    """依進場、止損、止盈2 推算合約網格參數"""
+    # 區間只從「進場價旁邊」到「止盈2」：開單時幾乎就是滿倉，往有利方向一路分批止盈；
+    # 往不利方向不會加倉，碰到止損就整個停掉（效果接近直接開單＋分批止盈）
+    if r["side"] == "LONG":
+        lo, hi = r["entry"] * (1 - GRID_PAD_PCT / 100), r["tp2"]
+    else:
+        lo, hi = r["tp2"], r["entry"] * (1 + GRID_PAD_PCT / 100)
+    width_pct = (hi - lo) / r["entry"] * 100
+    n = int(min(max(round(width_pct / GRID_STEP_PCT), 5), 50))
+    return lo, hi, n
+
+
 def signal_text(r):
-    side = "做多 🟢" if r["side"] == "LONG" else "做空 🔴"
-    warn = "\n⚠ 止損接近強平，請降槓桿" if r["liq_warn"] else ""
+    is_long = r["side"] == "LONG"
+    side = "做多 🟢" if is_long else "做空 🔴"
     tested = "✅ 已回測合格" if r["base"] in TESTED_COINS else "⚠ 尚未回測，請謹慎"
+    lev_line = (f"⚠ 這筆 {LEVERAGE} 倍風險偏高，建議最高 {r['max_lev']} 倍"
+                if r["max_lev"] < LEVERAGE else f"槓桿 {LEVERAGE} 倍 OK（建議最高 {r['max_lev']} 倍）")
+    lo, hi, n = grid_plan(r)
     return (f"【派網訊號】{r['base']} {side}\n"
             f"{tested}\n"
             f"1H K 線收盤：{r['bar_time']}\n"
+            f"{lev_line}\n"
+            f"\n"
+            f"▍方式一：直接開單（趨勢強時優先）\n"
+            f"{'開多' if is_long else '開空'}・市價・{LEVERAGE} 倍・{MARGIN_USDT}U\n"
             f"進場：{fmt_price(r['entry'])}\n"
             f"止損：{fmt_price(r['sl'])}（-{r['sl_pct']:.2f}%，約 -{r['loss']:.1f}U）\n"
-            f"止盈1：{fmt_price(r['tp1'])}（約 +{r['win1']:.1f}U，平一半）\n"
+            f"止盈1：{fmt_price(r['tp1'])}（全倉約 +{r['win1']:.1f}U，建議先平一半）\n"
             f"止盈2：{fmt_price(r['tp2'])}（約 +{r['win2']:.1f}U）\n"
-            f"以 {LEVERAGE} 倍、{MARGIN_USDT}U 計算{warn}\n"
+            f"\n"
+            f"▍方式二：合約網格（分批止盈版）\n"
+            f"方向：{'做多' if is_long else '做空'}・{LEVERAGE} 倍・{MARGIN_USDT}U\n"
+            f"價格區間：{fmt_price(lo)} ～ {fmt_price(hi)}\n"
+            f"網格數：{n} 格\n"
+            f"止損：{fmt_price(r['sl'])}　止盈：{fmt_price(r['tp2'])}\n"
+            f"\n"
             f"下單前請在派網確認價格。")
 
 
