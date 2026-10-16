@@ -276,6 +276,7 @@ def row_html(r):
     warn = ""
     if r["note"]: warn += f'<div class="warn">{r["note"]}</div>'
     if r["liq_warn"]: warn += f'<div class="warn">止損 {r["sl_pct"]:.1f}%，{LEVERAGE} 倍風險偏高，建議最高 {r["max_lev"]} 倍</div>'
+    warn += f'<div class="gridbox"><b>網格設定（手動填）</b><br>{grid_cell(r)}</div>'
     pd = r.get("pend")
     if pd:
         act = "限價賣出（開空）" if r["side"] == "SHORT" else "限價買入（開多）"
@@ -293,7 +294,6 @@ def row_html(r):
   <td class="num down-c">{fmt_price(r["sl"])}<div class="sub">−{r["sl_pct"]:.2f}%・−{r["loss"]:.1f}U</div></td>
   <td class="num up-c">{fmt_price(r["tp1"])}<div class="sub">+{r["win1"]:.1f}U</div></td>
   <td class="num up-c">{fmt_price(r["tp2"])}<div class="sub">+{r["win2"]:.1f}U</div></td>
-  <td class="grid">{grid_cell(r)}</td>
 </tr>"""
 
 
@@ -305,7 +305,7 @@ def table_html(title, rows, side_cls):
   <h2 class="{side_cls}">{title}<span class="count">{len(rows)}</span></h2>
   <div class="scroll"><table>
     <thead><tr><th>幣種 / 方向 / 成交額</th><th>現價 / 24h</th><th>判斷</th><th>4H MACD</th>
-    <th>1H KDJ</th><th>進場</th><th>止損</th><th>止盈1</th><th>止盈2</th><th>網格設定（手動）</th></tr></thead>
+    <th>1H KDJ</th><th>進場</th><th>止損</th><th>止盈1</th><th>止盈2</th></tr></thead>
     <tbody>{"".join(row_html(r) for r in rows)}</tbody>
   </table></div>
 </section>"""
@@ -344,7 +344,7 @@ h2 {{ font-size:16px; margin:0 0 10px; display:flex; align-items:center; gap:8px
 h2.long {{ color:var(--up); }} h2.short {{ color:var(--down); }} h2.pend-h {{ color:var(--accent); }}
 .count {{ font-size:12px; color:var(--muted); font-weight:400; }}
 .scroll {{ overflow-x:auto; background:var(--panel); border:1px solid var(--line); border-radius:8px; }}
-table {{ border-collapse:collapse; width:100%; min-width:1180px; }}
+table {{ border-collapse:collapse; width:100%; min-width:960px; }}
 th, td {{ padding:10px 12px; text-align:left; vertical-align:top; border-bottom:1px solid var(--line); }}
 th {{ font-size:12px; color:var(--muted); font-weight:500; white-space:nowrap; }}
 tr:last-child td {{ border-bottom:0; }}
@@ -359,7 +359,7 @@ th:nth-child(n+6), th:nth-child(2) {{ text-align:right; }}
 .g3 {{ color:var(--up); background:color-mix(in srgb, var(--up) 12%, transparent); }}
 .g2 {{ color:var(--accent); }} .g1 {{ color:var(--amber); }} .g0 {{ color:var(--muted); }}
 .warn {{ color:var(--amber); font-size:12px; margin-top:4px; }}
-.grid {{ font-size:12px; line-height:1.7; white-space:nowrap; font-variant-numeric:tabular-nums; }}
+.gridbox {{ font-size:12px; margin-top:6px; padding:6px 8px; border-radius:6px; background:color-mix(in srgb, var(--up) 10%, transparent); color:var(--fg); line-height:1.6; white-space:nowrap; font-variant-numeric:tabular-nums; }}
 .pend {{ font-size:12px; margin-top:6px; padding:6px 8px; border-radius:6px; background:color-mix(in srgb, var(--accent) 10%, transparent); color:var(--fg); line-height:1.6; white-space:nowrap; }}
 .empty {{ color:var(--muted); background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:16px; margin:0; }}
 .legend {{ color:var(--muted); font-size:13px; line-height:1.8; }}
